@@ -1626,10 +1626,10 @@ class Aviro:
     def __init__(self, api_key: str, base_url: str, auto_submit: bool = True):
         if not api_key:
             raise RuntimeError("api_key is required for Aviro().")
-        if not base_url:
-            raise RuntimeError("base_url is required for Aviro().")
+        # Resolve base_url with defaults: env override, then hard default
+        resolved_base_url = base_url or os.getenv("AVIRO_BASE_URL") or "https://api.aviro.ai"
         self.api_key = api_key
-        self.base_url = base_url
+        self.base_url = resolved_base_url
 
         self.auto_submit = auto_submit
         self.current_span = None
@@ -2014,7 +2014,7 @@ def print_flat_calls(aviro_instance: 'Aviro' = None, file_path: str = None) -> N
 class AviroClient:
     """Main Aviro client class - follows OpenAI client pattern"""
 
-    def __init__(self, api_key: str, base_url: str, auto_submit: bool = True):
+    def __init__(self, api_key: str, base_url: str = None, auto_submit: bool = True):
         """Initialize Aviro client with credentials
 
         Args:
@@ -2024,9 +2024,9 @@ class AviroClient:
         """
         if not api_key:
             raise RuntimeError("api_key is required for AviroClient.")
-        if not base_url:
-            raise RuntimeError("base_url is required for AviroClient.")
-        self._aviro = Aviro(api_key=api_key, base_url=base_url, auto_submit=auto_submit)
+        # Resolve base_url with defaults: env override, then hard default
+        resolved_base_url = base_url or os.getenv("AVIRO_BASE_URL") or "https://api.aviro.ai"
+        self._aviro = Aviro(api_key=api_key, base_url=resolved_base_url, auto_submit=auto_submit)
 
     @contextmanager
     def loop(self, loop_name: str, organization_name: str = None):
