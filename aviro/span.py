@@ -1,4 +1,5 @@
 import json
+import warnings
 import uuid
 import threading
 import requests
@@ -15,9 +16,13 @@ from pydantic import BaseModel
 # Thread-local storage for patch management and prompt tracking
 _thread_local = threading.local()
 
+# Global singleton for automatic Aviro instance creation
+_global_aviro = None
+
 # Store original functions
 _original_requests_session_send = requests.Session.send
 _original_httpx_async_client_send = httpx.AsyncClient.send
+_original_httpx_client_send = httpx.Client.send
 
 def _init_thread_local():
     """Initialize thread-local storage if needed."""
@@ -31,6 +36,12 @@ def _init_thread_local():
         _thread_local.current_span_instance = None
     if not hasattr(_thread_local, 'original_messages_context'):
         _thread_local.original_messages_context = None
+    if not hasattr(_thread_local, 'observation_enabled'):
+        _thread_local.observation_enabled = False
+    if not hasattr(_thread_local, 'current_agent_id'):
+        _thread_local.current_agent_id = None
+    if not hasattr(_thread_local, 'agent_stack'):
+        _thread_local.agent_stack = []
 
 class PromptNotFoundError(Exception):
     """Exception raised when a prompt is not found"""
@@ -40,7 +51,7 @@ class PromptNotFoundError(Exception):
         super().__init__(self.message)
 
 class MarkedResponse(str):
-    """A string subclass that carries Tropir marker metadata and can self-mark.
+    """A string subclass that carries Aviro marker metadata and can self-mark.
 
     Usage:
         resp = await llm.ask(...)
@@ -82,10 +93,11 @@ def get_current_span() -> Optional['Span']:
 
 
 class Span:
-    def __init__(self, span_name: str, api_key: str = None, base_url: str = None):
+    def __init__(self, span_name: str, api_key: str = None, base_url: str = None, organization_name: str = None):
         # Generate unique UUID for each span run (not deterministic)
         self.span_id = str(uuid.uuid4())
         self.span_name = span_name
+        self.organization_name = organization_name
         self.api_key = api_key
         self._base_url = base_url
         self.start_time = datetime.now().isoformat()
@@ -105,7 +117,8 @@ class Span:
             "prompts": {},   # prompt_id -> {template, parameters, llm_call_ids, created_at}
             "evaluators": {},  # evaluator_name -> {evaluator_prompt, variables, model, temperature, structured_output, created_at}
             "marked_data": {},  # marker_name -> {content, created_by_call, used_in}
-            "loops": {}      # loop_name -> {calls, flow_edges}
+            "loops": {},      # loop_name -> {calls, flow_edges}
+            "agents": {}      # agent_id -> {calls, edges, markers, policy}
         }
 
         # Tracking state
@@ -121,21 +134,23 @@ class Span:
         self._pending_marker_usage = []  # Track multiple marker usage in compile()
         self._pending_usage_records = [] # Store pending marker usage records
 
+        # Agent observation state
+        self._agents = {}
+
     def _is_llm_endpoint(self, url: str) -> bool:
         """Check if URL is an LLM API endpoint we should monitor"""
         llm_patterns = [
-            # OpenAI endpoints
+            # OpenAI
+            "api.openai.com",
+            # Anthropic
+            "api.anthropic.com",
+            # Google Gemini
+            "generativelanguage.googleapis.com",
+            # OpenRouter
+            "openrouter.ai",
+            # Local/proxy endpoints
             "localhost:8080/openai",
-            "api.tropir.com/openai",
-            "api.openai.com/v1/chat/completions",
-            "api.openai.com/v1/responses",
-            # Anthropic endpoints
-            "api.anthropic.com/v1/messages",
-            # Gemini endpoints
-            "generativelanguage.googleapis.com/v1beta/models",
-            "generativelanguage.googleapis.com/v1/models",
-            # OpenRouter endpoints
-            "openrouter.ai/api/v1/chat/completions"
+            "api.aviro.com/openai"
         ]
         return any(pattern in url for pattern in llm_patterns)
 
@@ -307,6 +322,14 @@ class Span:
                 if edge.get("to") == old_call_id:
                     edge["to"] = new_call_id
 
+        # Update agent edges
+        for agent_id, agent_data in self.tree.get("agents", {}).items():
+            for edge in agent_data.get("edges", []):
+                if edge.get("from") == old_call_id:
+                    edge["from"] = new_call_id
+                if edge.get("to") == old_call_id:
+                    edge["to"] = new_call_id
+
         # Update marked data usage records
         for marker_name, marker_data in self.tree.get("marked_data", {}).items():
             if marker_data.get("created_by_call") == old_call_id:
@@ -431,13 +454,10 @@ class Span:
 
                 if response.status_code == 200:
                     result = response.json()
-                    print(f"✅ Prompt '{prompt_id}' created successfully in webapp")
                 else:
-                    print(f"⚠️ Failed to create prompt in webapp: {response.status_code}")
                     # Fall back to local storage
                     self._set_prompt_local(prompt_id, template, parameters)
             except Exception as e:
-                print(f"⚠️ Failed to create prompt in webapp: {e}")
                 # Fall back to local storage
                 self._set_prompt_local(prompt_id, template, parameters)
         else:
@@ -485,7 +505,6 @@ class Span:
                 raise
             except Exception as e:
                 # Evaluator doesn't exist or check failed, continue with creation
-                print(f"Debug: Evaluator check failed: {e}")
                 pass
 
         # Convert Pydantic model to schema if provided
@@ -524,13 +543,10 @@ class Span:
 
                 if response.status_code == 200:
                     result = response.json()
-                    print(f"✅ Evaluator '{evaluator_name}' created successfully in webapp")
                 else:
-                    print(f"⚠️ Failed to create evaluator in webapp: {response.status_code}")
                     # Fall back to local storage
                     self._set_evaluator_local(evaluator_name, evaluator_prompt, variables, model, temperature, processed_structured_output, pydantic_model_class)
             except Exception as e:
-                print(f"⚠️ Failed to create evaluator in webapp: {e}")
                 # Fall back to local storage
                 self._set_evaluator_local(evaluator_name, evaluator_prompt, variables, model, temperature, processed_structured_output, pydantic_model_class)
         else:
@@ -576,7 +592,7 @@ class Span:
 
     def get_evaluator(self, evaluator_name: str, default_evaluator_prompt: str = None,
                      default_variables: List[str] = None, default_structured_output: Union[Dict, Type[BaseModel]] = None,
-                     tropir_instance: 'Tropir' = None) -> 'EvaluatorTemplate':
+                     aviro_instance: 'Aviro' = None) -> 'EvaluatorTemplate':
         """Get or create an evaluator template - completely local, no API calls"""
         if evaluator_name not in self.evaluator_registry:
             # If no default_evaluator_prompt provided, raise exception
@@ -622,7 +638,7 @@ class Span:
                 "evaluator_name": evaluator_name
             }
 
-        return EvaluatorTemplate(evaluator_name, self.evaluator_registry[evaluator_name], self, tropir_instance)
+        return EvaluatorTemplate(evaluator_name, self.evaluator_registry[evaluator_name], self, aviro_instance)
 
 
     @contextmanager
@@ -676,9 +692,11 @@ class Span:
             # Create bound methods for the span instance
             bound_requests_send = lambda session_instance, request, **kwargs: self._patched_requests_session_send(session_instance, request, **kwargs)
             bound_httpx_send = lambda client_instance, request, **kwargs: self._patched_httpx_async_client_send(client_instance, request, **kwargs)
+            bound_httpx_sync_send = lambda client_instance, request, **kwargs: self._patched_httpx_client_send(client_instance, request, **kwargs)
 
             requests.Session.send = bound_requests_send
             httpx.AsyncClient.send = bound_httpx_send
+            httpx.Client.send = bound_httpx_sync_send
         _thread_local.patch_count += 1
         _thread_local.httpx_patch_count += 1
 
@@ -694,6 +712,7 @@ class Span:
             _thread_local.httpx_patch_count -= 1
             if _thread_local.httpx_patch_count == 0:
                 httpx.AsyncClient.send = _original_httpx_async_client_send
+                httpx.Client.send = _original_httpx_client_send
 
     async def _patched_httpx_async_client_send(self, client_instance, request, **kwargs):
         """Patched version of httpx.AsyncClient.send for monitoring"""
@@ -708,6 +727,16 @@ class Span:
         if self._is_llm_endpoint(str(request.url)):
             self._capture_response_data(response, is_async=True)
 
+        return response
+
+    def _patched_httpx_client_send(self, client_instance, request, **kwargs):
+        """Patched version of httpx.Client.send for monitoring (sync)."""
+        url = str(request.url)
+        if self._is_llm_endpoint(url):
+            self._capture_request_data(request, url, is_async=False)
+        response = _original_httpx_client_send(client_instance, request, **kwargs)
+        if self._is_llm_endpoint(url):
+            self._capture_response_data(response, is_async=False)
         return response
 
     def _patched_requests_session_send(self, session_instance, request, **kwargs):
@@ -877,6 +906,41 @@ class Span:
             # Store duration in metadata (ensure it's never null)
             self.current_call_record["metadata"]["duration_ms"] = self.current_call_record.get("duration_ms", 0)
 
+            # Agent auto-mark and follow policies
+            try:
+                _init_thread_local()
+                agent_id = getattr(_thread_local, 'current_agent_id', None)
+                obs_enabled = getattr(_thread_local, 'observation_enabled', False)
+                if obs_enabled and agent_id:
+                    self._ensure_agent_bucket(agent_id)
+                    # Extract assistant text for known formats
+                    assistant_text = self._extract_llm_response_text(response_data)
+
+                    # Create marker for EVERY response (even tool calls with no text content)
+                    # This ensures edges are created for all calls in a sequence
+                    marker_id = f"m_{uuid.uuid4().hex[:12]}"
+                    marker = {
+                        "marker_id": marker_id,
+                        "content_length": len(assistant_text) if assistant_text else 0,
+                        "created_by_call": self.current_call_record["call_id"],
+                        "created_at": datetime.now().isoformat()
+                    }
+                    self.tree["agents"][agent_id]["markers"][marker_id] = marker
+
+                    # Apply follow policy
+                    policy = self._agents[agent_id].get("follow_policy", {"type": "none"})
+                    if policy.get("type") == "fanout_all":
+                        self._agents[agent_id]["active_markers"].add(marker_id)
+                    elif policy.get("type") == "last_only":
+                        self._agents[agent_id]["active_markers"] = {marker_id}
+                    elif policy.get("type") == "window":
+                        n = int(policy.get("n", 1))
+                        current = list(self._agents[agent_id]["active_markers"]) + [marker_id]
+                        self._agents[agent_id]["active_markers"] = set(current[-n:])
+                        # type "none" adds nothing
+            except Exception:
+                pass
+
         except Exception as e:
             # Store comprehensive error information - never leave response as null
             error_info = {
@@ -908,12 +972,16 @@ class Span:
 
     def _capture_request_data(self, request, url: str, is_async: bool):
         """Capture request data for LLM calls"""
-        # Check for loop context
+        # If loop context exists, use loop linkage; otherwise, check global observation
         if hasattr(self, 'current_loop_context') and self.current_loop_context:
-            #    context - create flow edges
             self._capture_request_in_loop(request, url, is_async)
-        else:
             return
+
+        _init_thread_local()
+        if getattr(_thread_local, 'observation_enabled', False):
+            self._capture_request_with_agents(request, url, is_async)
+            return
+        return
 
     def _capture_request_in_loop(self, request, url: str, is_async: bool):
         """Capture request data for LLM calls within a loop context"""
@@ -1003,6 +1071,78 @@ class Span:
 
 
 
+
+    def _ensure_agent_bucket(self, agent_id: str):
+        if agent_id not in self.tree["agents"]:
+            self.tree["agents"][agent_id] = {
+                "calls": [],
+                "edges": [],
+                "markers": {},
+                "policy": {"type": "none"}
+            }
+        if agent_id not in self._agents:
+            self._agents[agent_id] = {
+                "active_markers": set(),
+                "follow_policy": {"type": "none"}
+            }
+
+    def _capture_request_with_agents(self, request, url: str, is_async: bool):
+        """Capture request data for LLM calls under agent observation (no loops)."""
+        _init_thread_local()
+        agent_id = getattr(_thread_local, 'current_agent_id', None) or "default"
+        self._ensure_agent_bucket(agent_id)
+
+        temp_call_id = str(uuid.uuid4())
+        call_record = {
+            "call_id": temp_call_id,
+            "start_time": datetime.now().isoformat(),
+            "end_time": None,
+            "duration_ms": None,
+            "request": {},
+            "response": {},
+            "metadata": {
+                "model": "unknown",
+                "prompt_ids": [],
+                "request_url": url,
+                "status_code": 0,
+                "duration_ms": 0
+            }
+        }
+
+        self.tree["agents"][agent_id]["calls"].append(call_record)
+        self.current_call_record = call_record
+
+        # Build edges from active markers according to policy
+        active_markers = list(self._agents[agent_id]["active_markers"]) if agent_id in self._agents else []
+        for marker_id in active_markers:
+            marker = self.tree["agents"][agent_id]["markers"].get(marker_id)
+            if marker and marker.get("created_by_call"):
+                edge = {
+                    "from": marker["created_by_call"],
+                    "to": temp_call_id,
+                    "edge_type": "follows"
+                }
+                self.tree["agents"][agent_id]["edges"].append(edge)
+
+        # Parse request payload for model
+        try:
+            if is_async:
+                content = request.content
+                content_type = request.headers.get("Content-Type", "").lower()
+            else:
+                content = request.body
+                content_type = request.headers.get("Content-Type", "").lower()
+            if "application/json" in content_type and content:
+                if isinstance(content, bytes):
+                    json_data = json.loads(content.decode('utf-8'))
+                else:
+                    json_data = json.loads(content)
+                self.current_call_record["request"] = json_data
+                model = json_data.get('model')
+                if model:
+                    self.current_call_record["metadata"]["model"] = model
+        except Exception:
+            pass
 
 
 
@@ -1119,7 +1259,7 @@ class EvaluatorNotFoundError(Exception):
 
 
 class EvaluatorTemplate:
-    def __init__(self, evaluator_name: str, evaluator_data: Dict, span: 'Span', tropir_instance: 'Tropir'):
+    def __init__(self, evaluator_name: str, evaluator_data: Dict, span: 'Span', aviro_instance: 'Aviro'):
         self.evaluator_name = evaluator_name
         self.evaluator_prompt = evaluator_data.get("evaluator_prompt", "")
         self.variables = evaluator_data.get("variables", [])
@@ -1128,15 +1268,13 @@ class EvaluatorTemplate:
         self.structured_output = evaluator_data.get("structured_output")
         self.pydantic_model_class = evaluator_data.get("pydantic_model_class")
         self.span = span
-        self.tropir = tropir_instance
+        self.aviro = aviro_instance
 
     def evaluate(self, **variables):
         """Evaluate with the given variables - always uses API to ensure database storage"""
         try:
             # Check if all expected variables are provided
             missing_variables = [var for var in self.variables if var not in variables]
-            if missing_variables:
-                print(f"Warning: Missing variables for evaluator '{self.evaluator_name}': {missing_variables}")
 
             # ALWAYS use API-based evaluation to ensure runs are stored in database
             # This ensures that evaluation runs appear in the web UI
@@ -1153,9 +1291,9 @@ class EvaluatorTemplate:
         }
 
         response = requests.post(
-            f"{self.tropir.base_url}/api/evaluations",
+            f"{self.aviro.base_url}/api/evaluations",
             json=eval_data,
-            headers={"Authorization": f"Bearer {self.tropir.api_key}"},
+            headers={"Authorization": f"Bearer {self.aviro.api_key}"},
             timeout=10
         )
 
@@ -1166,9 +1304,9 @@ class EvaluatorTemplate:
 
 
 class Evaluator:
-    def __init__(self, evaluator_name: str, tropir_instance: 'Tropir'):
+    def __init__(self, evaluator_name: str, aviro_instance: 'Aviro'):
         self.evaluator_name = evaluator_name
-        self.tropir = tropir_instance
+        self.aviro = aviro_instance
 
     def evaluate(self, **variables):
         """Evaluate with the given variables"""
@@ -1181,9 +1319,9 @@ class Evaluator:
 
             # Send to the evaluations endpoint
             response = requests.post(
-                f"{self.tropir.base_url}/api/evaluations",
+                f"{self.aviro.base_url}/api/evaluations",
                 json=eval_data,
-                headers={"Authorization": f"Bearer {self.tropir.api_key}"},
+                headers={"Authorization": f"Bearer {self.aviro.api_key}"},
                 timeout=10
             )
 
@@ -1213,21 +1351,22 @@ class EvaluatorAlreadyExistsError(Exception):
 
 class SpanDecoratorContextManager:
     """A class that can be used as both a decorator and context manager"""
-    def __init__(self, tropir_instance: 'Tropir', span_name: str):
-        self.tropir = tropir_instance
+    def __init__(self, aviro_instance: 'Aviro', span_name: str, organization_name: str = None):
+        self.aviro = aviro_instance
         self.span_name = span_name
+        self.organization_name = organization_name
         self._context_manager = None
 
     def __call__(self, func):
         """When used as decorator"""
         def wrapper(*args, **kwargs):
-            with self.tropir._create_span(self.span_name) as span:
+            with self.aviro._create_span(self.span_name, self.organization_name) as span:
                 return func(*args, **kwargs)
         return wrapper
 
     def __enter__(self):
         """When used as context manager"""
-        self._context_manager = self.tropir._create_span(self.span_name)
+        self._context_manager = self.aviro._create_span(self.span_name, self.organization_name)
         return self._context_manager.__enter__()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -1239,33 +1378,272 @@ class SpanDecoratorContextManager:
 
 
 
-class Tropir:
-    def __init__(self, api_key: str = None, base_url: str = None, auto_submit: bool = True):
-        self.api_key = api_key
+class LoopDecoratorContextManager:
+    """Use as a decorator or context manager to create a span+loop in one.
 
-        # Check for development environment
-        if base_url is None:
-            env = os.getenv("ENVIRONMENT", "").lower()
-            if env == "dev":
-                self.base_url = "http://localhost:8080"
-            else:
-                self.base_url = "https://api.tropir.com"
+    Supports:
+        - @observe.loop("agent_span")
+        - with observe.loop("agent_span") as span:
+    """
+    def __init__(self, aviro_instance: 'Aviro', loop_name: str):
+        self.aviro = aviro_instance
+        self.loop_name = loop_name
+        self._span_cm = None
+        self._loop_cm = None
+        self._span = None
+
+    def __call__(self, func):
+        """Decorator usage: wraps function inside span + loop."""
+        def wrapper(*args, **kwargs):
+            with self.aviro._create_span(self.loop_name) as span:
+                with span.loop(self.loop_name):
+                    return func(*args, **kwargs)
+        return wrapper
+
+    def __enter__(self):
+        """Context manager usage: enters span then loop, returns span."""
+        self._span_cm = self.aviro._create_span(self.loop_name)
+        span = self._span_cm.__enter__()
+        self._loop_cm = span.loop(self.loop_name)
+        self._loop_cm.__enter__()
+        self._span = span
+        return span
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Exit loop first, then span
+        if self._loop_cm:
+            self._loop_cm.__exit__(exc_type, exc_val, exc_tb)
+        if self._span_cm:
+            return self._span_cm.__exit__(exc_type, exc_val, exc_tb)
+
+
+class _AgentTracker:
+    """Context manager and decorator for tracking LLM calls under a group scope (formerly agent).
+
+    Note: agent_id is deprecated in favor of group_name. Internally we continue to store under
+    tree["agents"][group_name] for backwards compatibility with existing UI/export code.
+    """
+    def __init__(self, agent_id: str, policy: str = "last_only", aviro_instance: 'Aviro' = None, organization_name: str = None):
+        self.agent_id = agent_id
+        self.group_name = agent_id
+        self.policy = policy
+        self.organization_name = organization_name
+        self._aviro = aviro_instance
+        self._span_created = False
+
+    def _get_aviro(self):
+        if self._aviro is None:
+            # Use configured global instance; do not auto-create from environment
+            global _global_aviro
+            if _global_aviro is None:
+                raise RuntimeError("Aviro client not configured. Call observe.configure(AviroClient(...)) before using observe().")
+            self._aviro = _global_aviro
+        return self._aviro
+
+    def __enter__(self):
+        _init_thread_local()
+        # Enable observation
+        _thread_local.observation_enabled = True
+
+        # Get or create span and apply patches
+        aviro = self._get_aviro()
+        span = aviro._get_or_create_temp_span()
+
+        # Ensure the span name reflects the agent id when using observe(...)
+        # so that UI grouping by span_name matches the agent/run group name.
+        try:
+            if getattr(span, 'span_name', None) != self.agent_id:
+                span.span_name = self.agent_id
+                if hasattr(span, 'tree') and isinstance(span.tree, dict):
+                    span.tree["span_name"] = self.agent_id
+        except Exception:
+            pass
+
+        # Set organization_name on the span if provided
+        if self.organization_name:
+            span.organization_name = self.organization_name
+
+        span._apply_http_patches()
+
+        # Set up agent scope
+        _thread_local.agent_stack.append(getattr(_thread_local, 'current_agent_id', None))
+        _thread_local.current_agent_id = self.agent_id
+
+        # Configure policy
+        span._ensure_agent_bucket(self.agent_id)
+        if isinstance(self.policy, dict) and 'window' in self.policy:
+            span._agents[self.agent_id]['follow_policy'] = {"type": "window", "n": int(self.policy['window'])}
+            span.tree['agents'][self.agent_id]['policy'] = {"type": "window", "n": int(self.policy['window'])}
+        elif self.policy == 'last_only':
+            span._agents[self.agent_id]['follow_policy'] = {"type": "last_only"}
+            span.tree['agents'][self.agent_id]['policy'] = {"type": "last_only"}
+        elif self.policy == 'fanout_all':
+            span._agents[self.agent_id]['follow_policy'] = {"type": "fanout_all"}
+            span.tree['agents'][self.agent_id]['policy'] = {"type": "fanout_all"}
         else:
-            self.base_url = base_url
+            span._agents[self.agent_id]['follow_policy'] = {"type": "none"}
+            span.tree['agents'][self.agent_id]['policy'] = {"type": "none"}
+
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _init_thread_local()
+        # Restore previous agent
+        prev = _thread_local.agent_stack.pop() if _thread_local.agent_stack else None
+        _thread_local.current_agent_id = prev
+
+        # If no more agents in stack, finalize and submit
+        if not _thread_local.agent_stack or not any(_thread_local.agent_stack):
+            aviro = self._get_aviro()
+            if aviro._temp_span:
+                aviro._temp_span.finalize()
+                if aviro.auto_submit:
+                    aviro.finalize_span(aviro._temp_span)
+                # Clear temp span so next observe() gets a fresh span
+                aviro._temp_span = None
+            # Disable observation
+            _thread_local.observation_enabled = False
+
+    def __call__(self, func):
+        """Decorator support"""
+        if asyncio.iscoroutinefunction(func):
+            async def async_wrapper(*args, **kwargs):
+                with self:
+                    return await func(*args, **kwargs)
+            return async_wrapper
+        else:
+            def sync_wrapper(*args, **kwargs):
+                with self:
+                    return func(*args, **kwargs)
+            return sync_wrapper
+
+    # Marker methods
+    def follow(self, marker_id: str):
+        aviro = self._get_aviro()
+        span = aviro._get_or_create_temp_span()
+        span._ensure_agent_bucket(self.agent_id)
+        span._agents[self.agent_id]['active_markers'].add(marker_id)
+
+    def unfollow(self, marker_id: str):
+        aviro = self._get_aviro()
+        span = aviro._get_or_create_temp_span()
+        span._ensure_agent_bucket(self.agent_id)
+        span._agents[self.agent_id]['active_markers'].discard(marker_id)
+
+    def expire_all(self):
+        aviro = self._get_aviro()
+        span = aviro._get_or_create_temp_span()
+        span._ensure_agent_bucket(self.agent_id)
+        span._agents[self.agent_id]['active_markers'] = set()
+
+    def mark(self, text: str, tag: str = None) -> str:
+        aviro = self._get_aviro()
+        span = aviro._get_or_create_temp_span()
+        span._ensure_agent_bucket(self.agent_id)
+        marker_id = f"m_{uuid.uuid4().hex[:12]}"
+        created_by = getattr(span, 'current_call_record', {}).get('call_id') if getattr(span, 'current_call_record', None) else None
+        span.tree['agents'][self.agent_id]['markers'][marker_id] = {
+            'marker_id': marker_id,
+            'tag': tag,
+            'content_length': len(text) if text is not None else 0,
+            'created_by_call': created_by,
+            'created_at': datetime.now().isoformat()
+        }
+        return marker_id
+
+
+class Observe:
+    """Simple observation API: observe.track(agent_id) as decorator or context manager."""
+
+    def __call__(self, agent_id: str = None, policy: str = "last_only", organization_name: str = None, group_name: str = None):
+        """Allow usage like observe(group_name="agent", organization_name="AcmeCorp") as decorator or context manager.
+
+        Args:
+            agent_id: Backwards-compatible identifier for the agent scope.
+            group_name: Preferred alias for agent_id that maps to the run group name in the UI.
+            policy: Follow policy for marker edges.
+            organization_name: Optional organization scope.
+        """
+        resolved_id = group_name or agent_id
+        if agent_id and not group_name:
+            warnings.warn("observe(agent_id=...) is deprecated. Use group_name=... instead.", DeprecationWarning, stacklevel=2)
+        if not resolved_id:
+            raise ValueError("You must provide group_name or agent_id")
+        return _AgentTracker(resolved_id, policy, aviro_instance=None, organization_name=organization_name)
+
+    @staticmethod
+    def track(agent_id: str = None, policy: str = "last_only", organization_name: str = None, group_name: str = None):
+        """Track LLM calls under an agent scope.
+
+        Usage as decorator:
+            @observe.track("my_agent", organization_name="AcmeCorp")
+            async def my_function():
+                # LLM calls tracked here
+                pass
+
+        Usage as context manager:
+            with observe.track("my_agent", organization_name="AcmeCorp"):
+                # LLM calls tracked here
+                pass
+
+        Args:
+            agent_id: Identifier for this agent
+            policy: Follow policy - "last_only", "fanout_all", {"window": n}, or "none"
+            organization_name: Optional organization name to scope this agent run
+        """
+        resolved_id = group_name or agent_id
+        if agent_id and not group_name:
+            warnings.warn("observe.track(agent_id=...) is deprecated. Use group_name=... instead.", DeprecationWarning, stacklevel=2)
+        if not resolved_id:
+            raise ValueError("You must provide group_name or agent_id")
+        return _AgentTracker(resolved_id, policy, aviro_instance=None, organization_name=organization_name)
+
+    @staticmethod
+    def configure(client: 'AviroClient'):
+        """Configure the global Aviro client used by observe(). Must be called once before use."""
+        global _global_aviro
+        if not isinstance(client, AviroClient):
+            raise TypeError("configure() expects an AviroClient instance")
+        _global_aviro = client._aviro
+
+    # Legacy compatibility
+    @staticmethod
+    def loop(span_name: str):
+        """Legacy loop API for backward compatibility."""
+        global _global_aviro
+        if _global_aviro is None:
+            api_key = os.getenv("AVIRO_API_KEY")
+            base_url = os.getenv("AVIRO_BASE_URL")
+            _global_aviro = Aviro(api_key=api_key, base_url=base_url, auto_submit=True)
+        return LoopDecoratorContextManager(_global_aviro, span_name)
+
+
+# Convenience singleton for users who want `observe.loop(...)`
+# Defer instantiation until after Aviro is defined to avoid NameError at import time
+# The actual instantiation is placed at the end of this module.
+
+class Aviro:
+    def __init__(self, api_key: str, base_url: str, auto_submit: bool = True):
+        if not api_key:
+            raise RuntimeError("api_key is required for Aviro().")
+        if not base_url:
+            raise RuntimeError("base_url is required for Aviro().")
+        self.api_key = api_key
+        self.base_url = base_url
 
         self.auto_submit = auto_submit
         self.current_span = None
         self._span_stack = []
         self._temp_span = None  # Temporary span for operations outside of active spans
 
-    def span(self, span_name: str):
+    def span(self, span_name: str, organization_name: str = None):
         """Create a new span - works as both decorator and context manager"""
-        return SpanDecoratorContextManager(self, span_name)
+        return SpanDecoratorContextManager(self, span_name, organization_name)
 
     @contextmanager
-    def _create_span(self, span_name: str):
+    def _create_span(self, span_name: str, organization_name: str = None):
         """Create and manage a span context"""
-        span = Span(span_name, self.api_key, self.base_url)
+        span = Span(span_name, self.api_key, self.base_url, organization_name)
 
         # Push to stack
         self._span_stack.append(self.current_span)
@@ -1284,7 +1662,7 @@ class Tropir:
         """Get or create a temporary span for operations outside of active spans"""
         if not self.current_span:
             if not self._temp_span:
-                self._temp_span = Span("temp", self.api_key, self.base_url)
+                self._temp_span = Span("temp", self.api_key, self.base_url, None)
             return self._temp_span
         return self.current_span
 
@@ -1339,7 +1717,7 @@ class Tropir:
                     return PromptTemplate(prompt_id, span.prompt_registry[prompt_id], span)
             except Exception as e:
                 # Log but don't fail - fallback to local
-                print(f"Warning: Failed to fetch prompt from API: {e}")
+                pass
 
         # Fallback to existing local logic
         span = self._get_or_create_temp_span()
@@ -1385,13 +1763,25 @@ class Tropir:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     timeout=10
                 )
+
                 if response.status_code == 201:
-                    print(f"✅ Span {span.span_name} submitted successfully")
+                    pass  # Success
+                elif response.status_code in [400, 404]:
+                    # Client errors - these are critical (ambiguous groups, missing orgs, etc.)
+                    error_text = response.text
+                    raise Exception(error_text)
+                elif response.status_code == 500:
+                    # Server error
+                    pass
                 else:
-                    print(f"⚠️ Failed to submit span: {response.status_code}")
-                    print(f"⚠️ Error details: {response.text}")
+                    pass
+            except requests.exceptions.RequestException as e:
+                # Continue silently for network errors - don't break user's code
+                pass
             except Exception as e:
-                print(f"⚠️ Failed to submit span: {e}")
+                # Re-raise critical errors (like ambiguous groups)
+                if "Multiple span groups found" in str(e) or ("Organization" in str(e) and "not found" in str(e)):
+                    raise
                 # Continue silently - don't break user's code
 
 
@@ -1442,9 +1832,75 @@ class Tropir:
 
 
 
+        # Determine group_name: if agents exist, use first agent_id, otherwise use span_name
+        group_name = tree.get("span_name")
+        agents = tree.get("agents", {})
+        if agents:
+            # Use the first (typically only) agent_id as the group name for observe() usage
+            group_name = list(agents.keys())[0]
+
+        # Build cases payload from agents (observe() usage) - send calls under cases with flow_edges
+        api_cases = {}
+        api_flow_edges = []
+        agents = tree.get("agents", {}) or {}
+
+        for agent_id, agent_data in agents.items():
+            try:
+                calls = agent_data.get("calls", []) or []
+                edges = agent_data.get("edges", []) or []
+
+                # Convert agent calls to LLMCall format for cases
+                if calls:
+                    api_cases[agent_id] = []
+                    for call in calls:
+                        # Extract fields from call dict
+                        call_id = call.get("call_id")
+                        request_payload = call.get("request", {})
+                        response_payload = call.get("response", {})
+                        metadata = call.get("metadata", {})
+
+                        # Build LLMCall structure
+                        llm_call = {
+                            "call_id": call_id,
+                            "case_name": agent_id,
+                            "start_time": call.get("start_time"),
+                            "end_time": call.get("end_time"),
+                            "duration_ms": call.get("duration_ms"),
+                            "request_payload": request_payload,
+                            "response_payload": response_payload,
+                            "messages": request_payload.get("messages", []),
+                            "response_text": "",  # Will be extracted by server
+                            "model": metadata.get("model", "unknown"),
+                            "prompt_ids": metadata.get("prompt_ids", []),
+                            "prompt_versions": metadata.get("prompt_versions", []),
+                            "metadata": metadata,
+                            "status_code": metadata.get("status_code"),
+                            "has_prompt": len(metadata.get("prompt_ids", [])) > 0
+                        }
+                        api_cases[agent_id].append(llm_call)
+
+                # Convert agent edges to FlowEdge format
+                for edge in edges:
+                    flow_edge = {
+                        "case_name": agent_id,
+                        "from_call_id": edge.get("from"),
+                        "to_call_id": edge.get("to"),
+                        "via_marker": edge.get("edge_type", "follows"),
+                        "via_prompt": None,
+                        "created_at": datetime.now().isoformat()
+                    }
+                    api_flow_edges.append(flow_edge)
+
+            except Exception as e:
+                # Never fail conversion due to malformed agent data
+                pass
+
         api_data = {
             "span_id": tree.get("span_id"),
             "span_name": tree.get("span_name"),
+            # Use agent_id as group name for observe(), otherwise span_name
+            "group_name": group_name,
+            "organization_name": span.organization_name if hasattr(span, 'organization_name') else None,
             "start_time": tree.get("start_time"),
             "end_time": tree.get("end_time"),
             "duration_ms": tree.get("duration_ms"),
@@ -1452,7 +1908,10 @@ class Tropir:
             "prompts": api_prompts,
             "evaluators": api_evaluators,
             "marked_data": tree.get("marked_data", {}),
-            "loops": tree.get("loops", {})
+            "cases": api_cases,
+            "loops": {},  # Empty - not using loops for observe()
+            "execution_flows": {},
+            "flow_edges": api_flow_edges
         }
 
         return api_data
@@ -1482,7 +1941,7 @@ class Tropir:
 
         # Try to get from local registry first
         if evaluator_name in span.evaluator_registry:
-            return span.get_evaluator(evaluator_name, tropir_instance=self)
+            return span.get_evaluator(evaluator_name, aviro_instance=self)
 
         # If we have a default prompt, create it locally
         if default_evaluator_prompt is not None:
@@ -1507,6 +1966,8 @@ class Tropir:
 
 
 
+# Instantiate the convenience singleton after all classes are defined
+observe = Observe()
 # Create convenience functions
 def prompt(template: str) -> str:
     """Create a prompt string (legacy compatibility)"""
@@ -1518,66 +1979,96 @@ def lm():
     pass
 
 
+# Pretty-print helpers for execution tree in flattened calls shape
+def get_flat_calls_json(aviro_instance: 'Aviro' = None) -> str:
+    """Return the flattened calls JSON string: {"calls": [...]}.
+
+    If no aviro_instance is provided, uses the global observer instance.
+    """
+    try:
+        av = aviro_instance if aviro_instance is not None else _global_aviro
+        tree = av.get_execution_tree() if av else {}
+        agents = (tree or {}).get("agents", {}) or {}
+        calls = []
+        for _agent_id, data in agents.items():
+            for c in (data.get("calls", []) or []):
+                calls.append(c)
+        return json.dumps({"calls": calls}, indent=2)
+    except Exception:
+        return json.dumps({"calls": []}, indent=2)
+
+
+def print_flat_calls(aviro_instance: 'Aviro' = None, file_path: str = None) -> None:
+    """Print the flattened calls JSON and optionally write it to file_path."""
+    payload = get_flat_calls_json(aviro_instance)
+    if file_path:
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(payload)
+        except Exception:
+            pass
+    return payload
+
+
 
 class AviroClient:
     """Main Aviro client class - follows OpenAI client pattern"""
 
-    def __init__(self, api_key: str = None, base_url: str = "https://api.aviro.com", auto_submit: bool = True):
+    def __init__(self, api_key: str, base_url: str, auto_submit: bool = True):
         """Initialize Aviro client with credentials
 
         Args:
-            api_key: Your Aviro API key. If not provided, will try to get from AVIRO_API_KEY env var.
-            base_url: Base URL for the Aviro API. Defaults to https://api.aviro.com
+            api_key: Your Aviro API key (required).
+            base_url: Base URL for the Aviro API (required).
             auto_submit: Whether to automatically submit spans to the API. Defaults to True.
         """
-        if api_key is None:
-            import os
-            api_key = os.environ.get("AVIRO_API_KEY")
-
-        if api_key is None:
-            raise RuntimeError("AVIRO_API_KEY is not set. Set the env var or pass api_key to AviroClient.")
-
-        self._tropir = Tropir(api_key=api_key, base_url=base_url, auto_submit=auto_submit)
+        if not api_key:
+            raise RuntimeError("api_key is required for AviroClient.")
+        if not base_url:
+            raise RuntimeError("base_url is required for AviroClient.")
+        self._aviro = Aviro(api_key=api_key, base_url=base_url, auto_submit=auto_submit)
 
     @contextmanager
-    def loop(self, loop_name: str):
+    def loop(self, loop_name: str, organization_name: str = None):
         """Create a loop context manager that tracks all LLM calls as connected
 
         Args:
             loop_name: Name for this loop/span
+            organization_name: Optional organization name to disambiguate groups
 
         Example:
             client = AviroClient()
-            with client.loop("my_agent_run") as span:
+            with client.loop("my_agent_run", organization_name="AcmeCorp") as span:
                 # Your agent code here
                 pass
         """
-        with self._tropir.span(loop_name) as span:
+        with self._aviro.span(loop_name, organization_name) as span:
             with span.loop(loop_name):
                 yield span
 
-    def span(self, span_name: str):
+    def span(self, span_name: str, organization_name: str = None):
         """Create a span context manager (without loop tracking)
 
         Args:
             span_name: Name for this span
+            organization_name: Optional organization name to disambiguate groups
         """
-        return self._tropir.span(span_name)
+        return self._aviro.span(span_name, organization_name)
 
     def set_prompt(self, prompt_id: str, template: str, parameters: dict = None):
         """Set a prompt template in the current span"""
-        return self._tropir.set_prompt(prompt_id, template, parameters)
+        return self._aviro.set_prompt(prompt_id, template, parameters)
 
     def set_evaluator(self, evaluator_name: str, evaluator_prompt: str, variables: list = None,
                      model: str = "gpt-4o-mini", temperature: float = 0.1,
                      structured_output = None):
         """Set an evaluator in the current span"""
-        return self._tropir.set_evaluator(evaluator_name, evaluator_prompt, variables, model, temperature, structured_output)
+        return self._aviro.set_evaluator(evaluator_name, evaluator_prompt, variables, model, temperature, structured_output)
 
     def get_evaluator(self, evaluator_name: str, default_evaluator_prompt: str = None,
                      default_variables: list = None, default_structured_output = None):
         """Get an evaluator from the current span"""
-        return self._tropir.get_evaluator(evaluator_name, default_evaluator_prompt, default_variables, default_structured_output)
+        return self._aviro.get_evaluator(evaluator_name, default_evaluator_prompt, default_variables, default_structured_output)
 
 # For backward compatibility, keep the old function-based API
 @contextmanager
