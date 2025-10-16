@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aviro"
-version = "0.1.5"
+version = "0.1.6"
 description = "thin sdk for agents to learn through experience"
 readme = "README.md"
 requires-python = ">=3.8"
